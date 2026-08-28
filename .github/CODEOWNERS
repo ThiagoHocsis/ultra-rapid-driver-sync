@@ -1,0 +1,23 @@
+# Propriedade de código dos caminhos críticos do motor de sincronização.
+#
+# Combinado com branch protection ("require review from Code Owners"), este arquivo é o
+# que torna obrigatória a aprovação humana nos caminhos em que o CI verde não é evidência
+# suficiente — porque são justamente os caminhos que definem o que "verde" significa.
+
+# Núcleo de sincronização: idempotência, guarda de versão, aplicação da projeção.
+/app/domain/sync/                    @luizalabs/logistica-ultrarapida-core
+
+# O harness protege a produção. Enfraquecê-lo é a regressão mais perigosa possível,
+# e é invisível: a suíte fica verde justamente porque parou de verificar.
+/harness/                            @luizalabs/logistica-ultrarapida-core
+
+# Contratos são consumidos por N times do ecossistema. Mudança aqui é mudança
+# na fronteira de todos eles.
+/specs/**/contracts/                 @luizalabs/logistica-ultrarapida-core @luizalabs/portal-entregadores
+
+# A constituição é a origem de todos os guardrails. Emenda exige decisão deliberada,
+# nunca um PR de conveniência.
+/.specify/memory/constitution.md     @luizalabs/logistica-ultrarapida-core
+
+# O pipeline não pode ser afrouxado por quem está tentando passar por ele.
+/.github/workflows/                  @luizalabs/logistica-ultrarapida-core

@@ -1,0 +1,235 @@
+name: Harness de Sincronização
+
+# Pipeline desenhado sob a premissa de que parte do código chega de agentes de IA.
+#
+# A ordem dos jobs é deliberada: os gates baratos e determinísticos rodam primeiro e
+# barram a maioria das regressões em segundos; os caros (concorrência com banco real,
+# mutation testing) só rodam sobre código que já passou pelos anteriores.
+#
+# Princípio de projeto do pipeline: **nenhum gate depende de julgamento humano atento.**
+# Revisão humana é a última linha, não a primeira — quando o autor do PR é um agente que
+# abre vinte PRs por dia, a atenção humana é o recurso que acaba primeiro.
+
+# NOTA SOBRE O GATILHO
+#
+# Este repositório entrega o *design*, não a aplicação — não há Gemfile nem código Ruby
+# para os jobs abaixo exercitarem. O gatilho real deste pipeline, num repositório com a
+# aplicação, seria:
+#
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#
+# Aqui ele fica em `workflow_dispatch` deliberadamente: preferimos um arquivo honesto,
+# legível como especificação do pipeline, a uma execução automática que falharia sempre
+# e sinalizaria uma verificação que não existe.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RAILS_ENV: test
+
+jobs:
+  # ---------------------------------------------------------------------------
+  estatica:
+    name: Estática e segurança de dependências
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+
+      - name: RuboCop
+        run: bundle exec rubocop --parallel
+
+      - name: Brakeman
+        run: bundle exec brakeman --no-pager --exit-on-warn
+
+      # Agentes de IA sugerem dependências com desenvoltura e não conhecem o
+      # histórico de CVE delas. Este gate é barato e pega a classe inteira.
+      - name: bundler-audit
+        run: |
+          bundle exec bundle-audit update
+          bundle exec bundle-audit check
+
+  # ---------------------------------------------------------------------------
+  contratos:
+    name: Contratos (validação e compatibilidade)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # necessário para diff contra o contrato publicado
+
+      - name: Valida AsyncAPI
+        run: npx --yes @asyncapi/cli validate specs/001-driver-sync-engine/contracts/asyncapi.yaml
+
+      - name: Valida OpenAPI
+        run: npx --yes @redocly/cli lint specs/001-driver-sync-engine/contracts/openapi.yaml
+
+      # Gate de compatibilidade: adicionar campo opcional passa; remover campo,
+      # renomear ou estreitar tipo falha sem bump de major.
+      # Um agente refatorando schema não distingue "campo que ninguém usa" de
+      # "campo que três consumidores leem" — essa distinção precisa vir daqui.
+      - name: Detecta mudança incompatível
+        run: bundle exec rake contracts:check_compatibility
+
+  # ---------------------------------------------------------------------------
+  propriedades:
+    name: Invariantes (testes de propriedade)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+      - run: bundle exec rails db:test:prepare
+
+      # Idempotência, convergência sob desordem e monotonicidade de versão.
+      # Entrada gerada, não escolhida: não há como satisfazer especializando o código.
+      - name: Testes de propriedade
+        run: bundle exec rspec harness/spec/properties --format documentation
+        env:
+          RANTLY_COUNT: 500  # em PR. No agendamento noturno, 10_000.
+
+      - name: Fitness functions e guardrails
+        run: bundle exec rspec harness/spec/guardrails harness/spec/contracts
+
+  # ---------------------------------------------------------------------------
+  concorrencia:
+    name: Concorrência (threads reais)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+      - run: bundle exec rails db:test:prepare
+
+      # Repetido 5 vezes com seeds diferentes: corrida é probabilística, e uma
+      # execução verde não é evidência. Um agente que reintroduza leitura-modificação-
+      # escrita costuma passar na primeira rodada e falhar na terceira.
+      - name: Suíte de concorrência
+        run: |
+          for seed in 1 2 3 4 5; do
+            echo "::group::seed $seed"
+            bundle exec rspec harness/spec/concurrency --seed "$seed" || exit 1
+            echo "::endgroup::"
+          done
+        env:
+          RAILS_MAX_THREADS: 32
+          DB_POOL: 40  # precisa exceder o número de threads, senão o teste morre
+                       # esperando conexão e o falso negativo parece flakiness
+
+  # ---------------------------------------------------------------------------
+  mutacao:
+    name: Mutation testing do núcleo
+    runs-on: ubuntu-latest
+    needs: [propriedades]
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+      - run: bundle exec rails db:test:prepare
+
+      # O gate que distingue "tem teste" de "tem teste que serve".
+      #
+      # Mutant altera o código deliberadamente — troca `<` por `<=`, inverte condição,
+      # remove chamada — e exige que a suíte quebre. Mutante sobrevivente é uma mudança
+      # de comportamento que nenhum teste percebeu.
+      #
+      # Aplicado apenas ao núcleo, e com exigência alta: 100% de cobertura de linha no
+      # motor de sincronização não significa nada se `aggregate_version < v` puder virar
+      # `<=` sem quebrar nada — e essa mutação específica destrói a idempotência.
+      - name: Mutant no núcleo de sincronização
+        run: bundle exec mutant run --since HEAD~1 -- 'Sync::EventApplier' 'Sync::ReconciliationApplier' 'Sync::DispatchPool'
+
+  # ---------------------------------------------------------------------------
+  simulacao_dr:
+    name: Simulação de recuperação de desastre
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'core-sync')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+
+      # Cenário completo em docker-compose: derruba o consumidor por N minutos,
+      # segue produzindo no Portal, sobe de volta e afirma convergência total da base
+      # mais respeito ao teto de vazão contra o banco do Portal.
+      #
+      # É a única forma de verificar T1/T2/T3 do ADR-08 de ponta a ponta; nenhum teste
+      # unitário cobre "o broker voltou e o relay despejou 2h de backlog de uma vez".
+      - name: Outage e catch-up
+        run: bundle exec rake dr:simulate_outage[7200]
+
+  # ---------------------------------------------------------------------------
+  revisao_humana:
+    name: Revisão humana em caminho protegido
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # Nem todo código merece o mesmo grau de desconfiança. Mudança no núcleo de
+      # sincronização, no harness ou nos contratos exige aprovação humana explícita,
+      # independentemente de a suíte estar verde — porque o que está em jogo aqui é
+      # justamente a definição do que "verde" significa.
+      #
+      # A obrigatoriedade da aprovação vem de CODEOWNERS + branch protection, não deste
+      # job. O papel dele é tornar o fato visível no PR: rotula, comenta e nomeia o que
+      # foi tocado, para que a revisão saiba onde olhar em vez de rolar o diff inteiro.
+      - name: Sinaliza alteração em caminho protegido
+        id: protegido
+        run: |
+          PROTECTED='^(app/domain/sync/|harness/|specs/.*/contracts/|\.specify/memory/constitution\.md)'
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || true)
+          HITS=$(echo "$CHANGED" | grep -E "$PROTECTED" || true)
+
+          if [ -n "$HITS" ]; then
+            {
+              echo "### Caminho protegido alterado"
+              echo
+              echo "Este PR toca o núcleo de sincronização, o harness ou os contratos."
+              echo "Aprovação humana é obrigatória (CODEOWNERS), mesmo com a suíte verde."
+              echo
+              echo '```'
+              echo "$HITS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rotula o PR
+        if: steps.protegido.outputs.hit == 'true' && github.event_name == 'pull_request'
+        run: gh pr edit "${{ github.event.pull_request.number }}" --add-label core-sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A label acionada acima é a mesma que dispara a simulação de DR neste PR.
+      # Efeito prático: mexer no núcleo aciona automaticamente o gate mais caro,
+      # sem depender de alguém lembrar de pedir.
