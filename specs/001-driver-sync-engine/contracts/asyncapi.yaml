@@ -1,0 +1,441 @@
+asyncapi: 3.0.0
+
+info:
+  title: Driver Lifecycle Events
+  version: 1.0.0
+  description: |
+    Contrato dos eventos de ciclo de vida do entregador emitidos pelo **Portal dos
+    Entregadores** (system of record) e consumidos por qualquer plataforma do ecossistema
+    Magalu — a Ultra-rápida sendo a primeira delas.
+
+    Este contrato é a fonte da verdade da integração (Princípio IV). Produtor e consumidor
+    validam payloads contra ele no CI; nenhum dos dois valida contra o outro.
+
+    ## Invariantes que o contrato carrega
+
+    - `aggregate_version` é monotônica e densa por `driver_id`, atribuída pelo Portal na
+      mesma transação que muda o estado. **É a ordem canônica do sistema.** O consumidor
+      aplica um evento se e somente se a versão for maior que a já persistida.
+    - `event_id` é UUIDv7, imutável, gerado na escrita no outbox. É a chave de
+      deduplicação de efeitos colaterais.
+    - `occurred_at` é **telemetria**, nunca critério de ordenação. Relógio de parede não
+      decide estado (ADR-02).
+    - Todo evento é um **fato completo**, não um delta: carrega o estado inteiro relevante
+      do entregador. É isso que torna a aplicação segura fora de ordem e o fan-out barato
+      (ADR-06).
+    - Nenhum campo de PII (CPF, CNH, dados bancários) trafega no payload. `document_ref` é
+      uma referência opaca, resolvível apenas sob autorização (Princípio VIII).
+  contact:
+    name: Time de Logística Ultra Rápida
+  license:
+    name: Proprietary
+
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.magalu.internal:9093
+    protocol: kafka-secure
+    description: |
+      Cluster compartilhado do ecossistema. mTLS no transporte, SASL/SCRAM por consumidor,
+      ACL de produção restrita ao Portal. A assinatura JWS no envelope torna a segurança
+      independente da configuração correta da ACL (ADR-11).
+    security:
+      - $ref: '#/components/securitySchemes/saslScram'
+
+channels:
+  driverLifecycle:
+    address: drivers.lifecycle.v1
+    title: Ciclo de vida do entregador
+    description: |
+      Tópico único, particionado por `driver_id`, retenção de 7 dias.
+
+      - **Particionar por `driver_id`** garante que todos os eventos de um entregador caiam
+        na mesma partição, consumida por um único membro do grupo. Isso remove a disputa no
+        caminho quente por construção (ADR-03).
+      - **Retenção de 7 dias**, e não as 24h padrão: precisa cobrir o outage de 2h da Black
+        Friday mais o tempo de diagnóstico humano em fim de semana (ADR-05).
+      - **Um consumer group por plataforma consumidora.** Adicionar o consumidor N+1 não
+        toca no Portal (Princípio III).
+    messages:
+      driverCreated:
+        $ref: '#/components/messages/DriverCreated'
+      driverUpdated:
+        $ref: '#/components/messages/DriverUpdated'
+      driverStatusChanged:
+        $ref: '#/components/messages/DriverStatusChanged'
+
+  driverLifecycleDlq:
+    address: drivers.lifecycle.v1.dlq.ultrafast
+    title: Dead letter queue da Ultra-rápida
+    description: |
+      DLQ **por consumidor**, nunca compartilhada. Uma DLQ compartilhada faria a falha de
+      um consumidor virar problema operacional dos outros, violando o Princípio III.
+      Redrive é operação manual e deliberada.
+    messages:
+      failedDriverEvent:
+        $ref: '#/components/messages/FailedDriverEvent'
+
+operations:
+  publishDriverLifecycle:
+    action: send
+    channel:
+      $ref: '#/channels/driverLifecycle'
+    title: Portal publica evento de ciclo de vida
+    description: |
+      Publicado pelo relay do outbox, não pelo request do usuário. A escrita de estado e a
+      linha de outbox são atômicas (ADR-01); a publicação é assíncrona e retentada
+      indefinidamente com backoff até obter sucesso.
+    messages:
+      - $ref: '#/channels/driverLifecycle/messages/driverCreated'
+      - $ref: '#/channels/driverLifecycle/messages/driverUpdated'
+      - $ref: '#/channels/driverLifecycle/messages/driverStatusChanged'
+
+  consumeDriverLifecycle:
+    action: receive
+    channel:
+      $ref: '#/channels/driverLifecycle'
+    title: Plataforma consumidora aplica evento na sua projeção local
+    description: |
+      Ordem de processamento obrigatória no consumidor:
+
+      1. Verifica a assinatura JWS do envelope. Falha → descarte com métrica, **sem
+         retentativa** (evento forjado não melhora com retry).
+      2. Valida o payload contra este schema. Falha → DLQ.
+      3. Numa única transação: grava `event_id` na barreira de dedup e aplica a projeção
+         com `WHERE aggregate_version < :version`.
+      4. Zero linhas afetadas → evento obsoleto ou duplicado. Descarte com métrica, **sem
+         retentativa**: não é falha, é a ordem correta se impondo.
+      5. Reavalia elegibilidade local e atualiza `last_synced_at`.
+      6. Só então faz commit do offset.
+
+      Falha de infraestrutura nos passos 3–5 → retentativa com backoff e full jitter,
+      teto de 5 tentativas, depois DLQ (ADR-07).
+    messages:
+      - $ref: '#/channels/driverLifecycle/messages/driverCreated'
+      - $ref: '#/channels/driverLifecycle/messages/driverUpdated'
+      - $ref: '#/channels/driverLifecycle/messages/driverStatusChanged'
+
+components:
+  securitySchemes:
+    saslScram:
+      type: scramSha512
+      description: Credencial por consumidor, somente leitura, rotacionável e revogável isoladamente.
+
+  messages:
+    DriverCreated:
+      name: DriverCreated
+      title: Entregador criado
+      summary: Emitido quando um entregador é cadastrado no Portal.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/DriverCreatedPayload'
+      examples:
+        - name: pessoaJuridicaAprovada
+          payload:
+            event_id: 0190f7c2-4a10-7c3e-9f21-6b1d2e0a4c11
+            event_type: driver.created
+            event_version: '1.0'
+            driver_id: 7f3b1c9a-2d4e-4a8b-9c1d-5e6f7a8b9c0d
+            aggregate_version: 1
+            occurred_at: '2026-08-27T14:32:10.482Z'
+            correlation_id: 3c9d1e2f-4a5b-6c7d-8e9f-0a1b2c3d4e5f
+            producer: portal-entregadores
+            data:
+              status: pending
+              legal_entity_type: company
+              documents_status: pending
+              document_ref: vault://drivers/7f3b1c9a/documents
+              vehicle_type: motorcycle
+              service_radius_km: 12
+              service_modes: [goods, food]
+              created_at: '2026-08-27T14:32:10.400Z'
+
+    DriverUpdated:
+      name: DriverUpdated
+      title: Perfil do entregador atualizado
+      summary: |
+        Emitido em mudança de dados operacionais — troca de veículo, alteração de raio de
+        entrega, mudança de modalidades, atualização de documentação.
+
+        Carrega o **estado completo após a mudança**, não o delta. Ver ADR-02: delta exigiria
+        ordem estrita de entrega, que é exatamente o que a arquitetura evita.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/DriverUpdatedPayload'
+      examples:
+        - name: trocaDeVeiculo
+          payload:
+            event_id: 0190f7c2-8b20-7d4f-a032-7c2e3f1b5d22
+            event_type: driver.updated
+            event_version: '1.0'
+            driver_id: 7f3b1c9a-2d4e-4a8b-9c1d-5e6f7a8b9c0d
+            aggregate_version: 7
+            occurred_at: '2026-08-27T15:02:44.120Z'
+            correlation_id: 5e6f7a8b-9c0d-1e2f-3a4b-5c6d7e8f9a0b
+            producer: portal-entregadores
+            data:
+              status: active
+              legal_entity_type: company
+              documents_status: approved
+              document_ref: vault://drivers/7f3b1c9a/documents
+              vehicle_type: car
+              service_radius_km: 25
+              service_modes: [goods]
+              changed_fields: [vehicle_type, service_radius_km, service_modes]
+
+    DriverStatusChanged:
+      name: DriverStatusChanged
+      title: Status do entregador alterado
+      summary: |
+        Emitido em transição de ciclo de vida: ativação, inativação, bloqueio, desbloqueio.
+
+        `blocked` é a transição crítica do sistema — é o único caso em que atraso de
+        propagação vira risco operacional e de segurança, e não apenas perda de receita.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/DriverStatusChangedPayload'
+      examples:
+        - name: bloqueioDeSeguranca
+          payload:
+            event_id: 0190f7c3-1c30-7e50-b143-8d3f4a2c6e33
+            event_type: driver.status_changed
+            event_version: '1.0'
+            driver_id: 7f3b1c9a-2d4e-4a8b-9c1d-5e6f7a8b9c0d
+            aggregate_version: 8
+            occurred_at: '2026-08-27T15:10:03.900Z'
+            correlation_id: 9a0b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d
+            producer: portal-entregadores
+            data:
+              status: blocked
+              previous_status: active
+              reason_code: security_review
+              legal_entity_type: company
+              documents_status: approved
+              vehicle_type: car
+              service_radius_km: 25
+              service_modes: [goods]
+              effective_at: '2026-08-27T15:10:03.850Z'
+
+    FailedDriverEvent:
+      name: FailedDriverEvent
+      title: Evento que esgotou as retentativas
+      contentType: application/json
+      payload:
+        type: object
+        required: [original_event, failure_reason, failed_at, attempts, consumer]
+        properties:
+          original_event:
+            type: object
+            description: Envelope original, preservado byte a byte para permitir redrive fiel.
+          failure_reason:
+            type: string
+          failure_class:
+            type: string
+            enum: [schema_validation, downstream_unavailable, timeout, unknown]
+          failed_at:
+            type: string
+            format: date-time
+          attempts:
+            type: integer
+          consumer:
+            type: string
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [signature, schema_version]
+      properties:
+        signature:
+          type: string
+          description: |
+            JWS compacto do envelope, assinado pelo Portal (Princípio VIII). O consumidor
+            rejeita evento cuja assinatura não valide — mesmo tendo chegado pelo tópico
+            correto. É o que mantém o sistema seguro se uma ACL do broker for afrouxada
+            por engano.
+        schema_version:
+          type: string
+          description: Versão do schema deste envelope.
+          examples: ['1.0']
+        partition_key:
+          type: string
+          description: Sempre `driver_id`. Garante ordem por agregado (ADR-03).
+
+    EventEnvelope:
+      type: object
+      description: Campos comuns a todo evento de ciclo de vida.
+      required:
+        - event_id
+        - event_type
+        - event_version
+        - driver_id
+        - aggregate_version
+        - occurred_at
+        - correlation_id
+        - producer
+        - data
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: |
+            UUIDv7, imutável, gerado na escrita no outbox. Chave de deduplicação de efeitos
+            colaterais externos (ADR-04). Ordenável por tempo, o que facilita diagnóstico.
+        event_type:
+          type: string
+          enum: [driver.created, driver.updated, driver.status_changed]
+        event_version:
+          type: string
+          description: Versão do contrato do evento. Mudança incompatível exige novo major.
+          examples: ['1.0']
+        driver_id:
+          type: string
+          format: uuid
+          description: Identidade estável do entregador no ecossistema. Também a chave de partição.
+        aggregate_version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            **Ordem canônica do sistema.** Monotônica e densa por `driver_id`, atribuída
+            pelo Portal na mesma transação da mudança de estado.
+
+            Regra de aplicação no consumidor: aplicar se e somente se
+            `aggregate_version > projecao.aggregate_version`. Lacuna na sequência (7 → 9)
+            indica evento perdido e dispara reconciliação daquele entregador.
+        occurred_at:
+          type: string
+          format: date-time
+          description: |
+            Instante da mudança no Portal. **Telemetria, não critério de ordenação.**
+            Usado para medir `applied_at − occurred_at` contra o SLA de 30s (Princípio IX).
+        correlation_id:
+          type: string
+          format: uuid
+          description: Propagado ponta a ponta para rastreamento distribuído.
+        producer:
+          type: string
+          description: Serviço emissor.
+          examples: ['portal-entregadores']
+
+    DriverFacts:
+      type: object
+      description: |
+        Fatos cadastrais crus. O Portal **não** emite veredito de elegibilidade — cada
+        consumidor decide com seus próprios critérios (Princípio V).
+
+        O payload carrega todos os fatos que um consumidor plausível possa precisar
+        justamente para que ele nunca precise consultar o Portal de forma síncrona para
+        decidir. É o que mantém o fan-out barato (ADR-06).
+      required: [status, legal_entity_type, documents_status]
+      properties:
+        status:
+          type: string
+          enum: [pending, approved, active, inactive, blocked]
+        legal_entity_type:
+          type: string
+          enum: [individual, company]
+          description: |
+            Exemplo canônico de critério divergente: o Portal aceita `individual`, a
+            Ultra-rápida exige `company`. A recusa é decisão de negócio registrada com
+            motivo — não é erro e não gera retentativa.
+        documents_status:
+          type: string
+          enum: [pending, approved, expired, rejected]
+        document_ref:
+          type: string
+          description: |
+            Referência opaca ao cofre de documentos. **Nunca** CPF, CNH ou dados bancários
+            em claro (Princípio VIII, LGPD).
+          examples: ['vault://drivers/7f3b1c9a/documents']
+        vehicle_type:
+          type: string
+          enum: [motorcycle, bicycle, car, van]
+          nullable: true
+        service_radius_km:
+          type: integer
+          minimum: 0
+          maximum: 200
+          nullable: true
+        service_modes:
+          type: array
+          items:
+            type: string
+            enum: [goods, food]
+
+    DriverCreatedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            event_type:
+              const: driver.created
+            aggregate_version:
+              const: 1
+              description: Criação é sempre a versão 1 do agregado.
+            data:
+              allOf:
+                - $ref: '#/components/schemas/DriverFacts'
+                - type: object
+                  properties:
+                    created_at:
+                      type: string
+                      format: date-time
+
+    DriverUpdatedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            event_type:
+              const: driver.updated
+            data:
+              allOf:
+                - $ref: '#/components/schemas/DriverFacts'
+                - type: object
+                  properties:
+                    changed_fields:
+                      type: array
+                      description: |
+                        Informativo, para observabilidade e auditoria. **Não** é o
+                        mecanismo de aplicação: o consumidor aplica o estado completo. Um
+                        consumidor que aplicasse apenas os campos listados aqui estaria
+                        tratando o evento como delta e quebraria sob desordem.
+                      items:
+                        type: string
+
+    DriverStatusChangedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            event_type:
+              const: driver.status_changed
+            data:
+              allOf:
+                - $ref: '#/components/schemas/DriverFacts'
+                - type: object
+                  required: [previous_status, effective_at]
+                  properties:
+                    previous_status:
+                      type: string
+                      enum: [pending, approved, active, inactive, blocked]
+                    reason_code:
+                      type: string
+                      enum:
+                        - security_review
+                        - document_expired
+                        - voluntary_pause
+                        - performance
+                        - fraud_suspicion
+                        - manual_review
+                        - reactivation
+                    effective_at:
+                      type: string
+                      format: date-time

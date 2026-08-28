@@ -1,0 +1,338 @@
+openapi: 3.0.3
+
+info:
+  title: Portal dos Entregadores — API de Reconciliação
+  version: 1.0.0
+  description: |
+    API de **reconciliação e catch-up**, consumida por plataformas do ecossistema Magalu
+    para reparar divergência entre a projeção local e o system of record.
+
+    ## Esta API não é o caminho de sincronização
+
+    O caminho normal é assíncrono, por eventos (ver `asyncapi.yaml`). Esta API existe para
+    os casos que o log de eventos não cobre:
+
+    - evento perdido além da retenção do broker (7 dias);
+    - mensagem em DLQ que nunca foi reprocessada;
+    - divergência por bug de consumo já corrigido;
+    - catch-up após indisponibilidade prolongada (ADR-08);
+    - lacuna detectada na sequência de `aggregate_version` (7 → 9).
+
+    Usar esta API como sincronização primária seria voltar ao acoplamento síncrono que a
+    arquitetura elimina, e não sustentaria o SLA de 30s para 300.000 entregadores.
+
+    ## O requisito que sustenta a segurança do mecanismo
+
+    Todo recurso devolve `aggregate_version` **junto com o estado**. Isso não é
+    conveniência: é obrigatório.
+
+    A reconciliação lê estado do Portal e o aplica depois — possivelmente minutos depois,
+    se a fila estiver sob vazão limitada. Nesse intervalo um evento ao vivo mais recente
+    pode já ter sido aplicado. Sem a versão no snapshot, o consumidor não teria como
+    comparar, e o mecanismo de **reparo** viraria mecanismo de **corrupção silenciosa**.
+
+    Com a versão, a reconciliação passa pela mesma guarda de todo o resto —
+    `WHERE aggregate_version < :version` — e não é um caminho privilegiado.
+
+    ## Proteção do system of record
+
+    Paginação por cursor é obrigatória; não há endpoint de dump irrestrito. O cursor é
+    estável, `(updated_at, id)` — nunca `OFFSET`, que sob escrita concorrente pula e repete
+    linhas. `rate limit` por cliente protege o banco do Portal, que é o gargalo real da
+    varredura (ADR-08).
+  contact:
+    name: Time do Portal dos Entregadores
+
+servers:
+  - url: https://portal-entregadores.magalu.internal/api
+    description: Produção (rede interna, mTLS obrigatório)
+
+security:
+  - clientCredentials: [drivers:read]
+
+tags:
+  - name: Reconciliação
+    description: Varredura paginada e consulta pontual para reparo de divergência.
+  - name: Operação
+    description: Sinais para operação e diagnóstico.
+
+paths:
+  /v1/drivers:
+    get:
+      tags: [Reconciliação]
+      operationId: listDriversForReconciliation
+      summary: Varre a base por página, a partir de um marcador temporal
+      description: |
+        Devolve entregadores ordenados por `(updated_at, id)`, cada um com sua
+        `aggregate_version` atual.
+
+        **Uso em catch-up após outage:** chamar com `updated_since` = início da janela de
+        indisponibilidade e seguir `next_cursor` até `has_more: false`.
+
+        **Uso em varredura periódica de saúde:** chamar com `updated_since` = última
+        varredura completa, detectando divergência residual mesmo sem incidente.
+
+        Dimensionamento de referência: 500 registros por página, 4 workers concorrentes,
+        teto de 500 entregadores/s. A 500/s, 300.000 entregadores levam ~10 minutos. Os
+        três parâmetros são ajustáveis em runtime, para que a operação possa afrouxar ou
+        apertar durante um incidente sem exigir deploy.
+      parameters:
+        - name: updated_since
+          in: query
+          required: true
+          description: |
+            Limite inferior de `updated_at`. Obrigatório: sem ele a chamada seria uma
+            varredura irrestrita da base, exatamente o que esta API existe para evitar.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-08-27T12:00:00Z'
+        - name: cursor
+          in: query
+          description: |
+            Cursor opaco de `next_cursor` da página anterior. Codifica `(updated_at, id)`.
+            Ausente na primeira página.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Registros por página.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 500
+        - name: status
+          in: query
+          description: |
+            Filtro opcional. Em catch-up de incidente, filtrar por `blocked` permite
+            priorizar a classe de divergência mais perigosa antes de varrer o resto.
+          schema:
+            type: string
+            enum: [pending, approved, active, inactive, blocked]
+      responses:
+        '200':
+          description: Página de entregadores.
+          headers:
+            X-RateLimit-Limit:
+              schema: { type: integer }
+              description: Cota de requisições por minuto para este cliente.
+            X-RateLimit-Remaining:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriverPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/drivers/{driver_id}:
+    get:
+      tags: [Reconciliação]
+      operationId: getDriverSnapshot
+      summary: Estado atual de um entregador, com versão
+      description: |
+        Reparo pontual. O uso principal é a **detecção de lacuna**: quando o consumidor
+        recebe a versão 9 tendo aplicado a 7, sabe que perdeu a 8 e consulta este endpoint
+        para aquele entregador específico — sem disparar varredura completa da base.
+      parameters:
+        - name: driver_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Estado atual do entregador.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriverSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Entregador inexistente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /v1/sync/health:
+    get:
+      tags: [Operação]
+      operationId: getSyncHealth
+      summary: Saúde do pipeline de emissão
+      description: |
+        Expõe o *outbox lag* — idade da linha não publicada mais antiga. É o sinal único
+        mais importante do sistema: detecta relay parado, broker indisponível e degradação
+        de rede, e antecede a violação do SLA de 30s.
+
+        Permite que um consumidor distinga "não recebo eventos porque nada mudou" de "não
+        recebo eventos porque a emissão está quebrada" — distinção que decide se ele deve
+        acionar reconciliação.
+      security: []
+      responses:
+        '200':
+          description: Estado do pipeline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncHealth'
+
+components:
+  securitySchemes:
+    clientCredentials:
+      type: oauth2
+      description: |
+        OAuth2 client credentials, com credencial e escopo por plataforma consumidora —
+        revogável isoladamente, sem afetar os demais consumidores (Princípio VIII).
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.magalu.internal/oauth2/token
+          scopes:
+            drivers:read: Leitura de estado de entregadores para reconciliação.
+
+  schemas:
+    DriverSnapshot:
+      type: object
+      required: [driver_id, aggregate_version, status, legal_entity_type, documents_status, updated_at]
+      properties:
+        driver_id:
+          type: string
+          format: uuid
+        aggregate_version:
+          type: integer
+          format: int64
+          description: |
+            **Campo obrigatório do contrato, não opcional.** É o que permite ao consumidor
+            aplicar o snapshot sob a mesma guarda `WHERE aggregate_version < :version` do
+            consumo ao vivo, impedindo que um estado lido há minutos sobrescreva um evento
+            mais recente já aplicado.
+          example: 8
+        status:
+          type: string
+          enum: [pending, approved, active, inactive, blocked]
+        legal_entity_type:
+          type: string
+          enum: [individual, company]
+        documents_status:
+          type: string
+          enum: [pending, approved, expired, rejected]
+        document_ref:
+          type: string
+          description: Referência opaca ao cofre. Nunca PII em claro.
+          nullable: true
+        vehicle_type:
+          type: string
+          enum: [motorcycle, bicycle, car, van]
+          nullable: true
+        service_radius_km:
+          type: integer
+          nullable: true
+        service_modes:
+          type: array
+          items:
+            type: string
+            enum: [goods, food]
+        updated_at:
+          type: string
+          format: date-time
+
+    DriverPage:
+      type: object
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DriverSnapshot'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Cursor opaco para a próxima página. `null` quando `has_more` é falso.
+        has_more:
+          type: boolean
+        server_time:
+          type: string
+          format: date-time
+          description: |
+            Relógio do Portal no momento da resposta. O consumidor usa este valor, e não o
+            próprio relógio, como `updated_since` da varredura seguinte — evitando lacuna
+            causada por *clock skew* entre os serviços.
+
+    SyncHealth:
+      type: object
+      required: [status, outbox_lag_seconds, oldest_unpublished_at]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        outbox_lag_seconds:
+          type: number
+          description: Idade da linha não publicada mais antiga.
+          example: 0.8
+        oldest_unpublished_at:
+          type: string
+          format: date-time
+          nullable: true
+        unpublished_count:
+          type: integer
+        relay_replicas_alive:
+          type: integer
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        correlation_id:
+          type: string
+          format: uuid
+          description: Propagado para permitir rastrear a chamada ponta a ponta.
+
+  responses:
+    BadRequest:
+      description: Parâmetro inválido — cursor malformado ou `updated_since` ausente.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Credencial ausente, expirada ou sem o escopo `drivers:read`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: |
+        Cota excedida. O consumidor respeita `Retry-After` e reduz a concorrência da
+        varredura — a reconciliação nunca deve ser a causa de indisponibilidade do Portal
+        que ela existe para reparar.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Segundos até a próxima tentativa permitida.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: |
+        Portal em degradação. O consumidor abre o circuit breaker e adia a varredura;
+        insistir aqui agrava o incidente.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
